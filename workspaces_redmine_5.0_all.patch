@@ -1,0 +1,1485 @@
+diff --git a/app/controllers/admin_controller.rb b/app/controllers/admin_controller.rb
+index 6f4dce808..abc0e02de 100644
+--- a/app/controllers/admin_controller.rb
++++ b/app/controllers/admin_controller.rb
+@@ -40,6 +40,8 @@ class AdminController < ApplicationController
+     @project_pages = Paginator.new @project_count, per_page_option, params['page']
+     @projects = scope.limit(@project_pages.per_page).offset(@project_pages.offset).to_a
+ 
++    @workspaces = Hash[Workspace.pluck(:id, :name)]
++
+     render :action => "projects", :layout => false if request.xhr?
+   end
+ 
+diff --git a/app/controllers/workflows_controller.rb b/app/controllers/workflows_controller.rb
+index c0d5f865e..e63e31dab 100644
+--- a/app/controllers/workflows_controller.rb
++++ b/app/controllers/workflows_controller.rb
+@@ -25,15 +25,17 @@ class WorkflowsController < ApplicationController
+   before_action :require_admin
+ 
+   def index
+-    @roles = Role.sorted.select(&:consider_workflow?)
+-    @trackers = Tracker.sorted
+-    @workflow_counts = WorkflowTransition.group(:tracker_id, :role_id).count
++    @workspaces = Workspace.sorted
++    @workspace = Workspace.find_by_id(params[:workspace_id]) || Workspace.first
++    @roles = Role.where(id: WorkflowTransition.where(workspace_id: @workspace.id).pluck(:role_id)).sorted.select(&:consider_workflow?)
++    @trackers = Tracker.where(id: WorkflowTransition.where(workspace_id: @workspace.id).pluck(:tracker_id)).sorted
++    @workflow_counts = WorkflowTransition.group(:tracker_id, :role_id, :workspace_id).count
+   end
+ 
+   def edit
+-    if @trackers && @roles && @statuses.any?
++    if @trackers && @roles && @workspaces && @statuses.any?
+       workflows = WorkflowTransition.
+-        where(:role_id => @roles.map(&:id), :tracker_id => @trackers.map(&:id)).
++        where(:role_id => @roles.map(&:id), :tracker_id => @trackers.map(&:id), :workspace_id => @workspaces.map(&:id)).
+         preload(:old_status, :new_status)
+       @workflows = {}
+       @workflows['always'] = workflows.select {|w| !w.author && !w.assignee}
+@@ -43,35 +45,35 @@ class WorkflowsController < ApplicationController
+   end
+ 
+   def update
+-    if @roles && @trackers && params[:transitions]
++    if @roles && @trackers && @workspaces && params[:transitions]
+       transitions = params[:transitions].deep_dup
+       transitions.each do |old_status_id, transitions_by_new_status|
+         transitions_by_new_status.each do |new_status_id, transition_by_rule|
+           transition_by_rule.reject! {|rule, transition| transition == 'no_change'}
+         end
+       end
+-      WorkflowTransition.replace_transitions(@trackers, @roles, transitions)
++      WorkflowTransition.replace_transitions(@trackers, @roles, transitions, @workspaces)
+       flash[:notice] = l(:notice_successful_update)
+     end
+     redirect_to_referer_or edit_workflows_path
+   end
+ 
+   def permissions
+-    if @roles && @trackers
++    if @roles && @trackers && @workspaces
+       @fields = (Tracker::CORE_FIELDS_ALL - @trackers.map(&:disabled_core_fields).reduce(:&)).map {|field| [field, l("field_"+field.sub(/_id$/, ''))]}
+       @custom_fields = @trackers.map(&:custom_fields).flatten.uniq.sort
+-      @permissions = WorkflowPermission.rules_by_status_id(@trackers, @roles)
++      @permissions = WorkflowPermission.rules_by_status_id(@trackers, @roles, @workspaces)
+       @statuses.each {|status| @permissions[status.id] ||= {}}
+     end
+   end
+ 
+   def update_permissions
+-    if @roles && @trackers && params[:permissions]
++    if @roles && @trackers && @workspaces && params[:permissions]
+       permissions = params[:permissions].deep_dup
+       permissions.each do |field, rule_by_status_id|
+         rule_by_status_id.reject! {|status_id, rule| rule == 'no_change'}
+       end
+-      WorkflowPermission.replace_permissions(@trackers, @roles, permissions)
++      WorkflowPermission.replace_permissions(@trackers, @roles, permissions, @workspaces)
+       flash[:notice] = l(:notice_successful_update)
+     end
+     redirect_to_referer_or permissions_workflows_path
+@@ -83,19 +85,20 @@ class WorkflowsController < ApplicationController
+ 
+   def duplicate
+     find_sources_and_targets
+-    if params[:source_tracker_id].blank? || params[:source_role_id].blank? ||
+-      (@source_tracker.nil? && @source_role.nil?)
++    if params[:source_tracker_id].blank? || params[:source_role_id].blank? || params[:source_workspace_id].blank? ||
++      (@source_tracker.nil? && @source_role.nil? && @source_workspace.nil?)
+       flash.now[:error] = l(:error_workflow_copy_source)
+       render :copy
+-    elsif @target_trackers.blank? || @target_roles.blank?
++    elsif @target_trackers.blank? || @target_roles.blank? || @target_workspaces.blank?
+       flash.now[:error] = l(:error_workflow_copy_target)
+       render :copy
+     else
+-      WorkflowRule.copy(@source_tracker, @source_role, @target_trackers, @target_roles)
++      WorkflowRule.copy(@source_tracker, @source_role, @source_workspace, @target_trackers, @target_roles, @target_workspaces)
+       flash[:notice] = l(:notice_successful_update)
+       redirect_to copy_workflows_path(
+         :source_tracker_id => @source_tracker,
+-        :source_role_id => @source_role
++        :source_role_id => @source_role,
++        :source_workspace_id => @source_workspace
+       )
+     end
+   end
+@@ -105,6 +108,7 @@ class WorkflowsController < ApplicationController
+   def find_sources_and_targets
+     @roles = Role.sorted.select(&:consider_workflow?)
+     @trackers = Tracker.sorted
++    @workspaces = Workspace.sorted
+     if params[:source_tracker_id].blank? || params[:source_tracker_id] == 'any'
+       @source_tracker = nil
+     else
+@@ -115,6 +119,11 @@ class WorkflowsController < ApplicationController
+     else
+       @source_role = Role.find_by_id(params[:source_role_id].to_i)
+     end
++    if params[:source_workspace_id].blank? || params[:source_workspace_id] == 'any'
++      @source_workspace = nil
++    else
++      @source_workspace = Workspace.find_by_id(params[:source_workspace_id].to_i)
++    end
+     @target_trackers =
+       if params[:target_tracker_ids].blank?
+         nil
+@@ -127,11 +136,18 @@ class WorkflowsController < ApplicationController
+       else
+         Role.where(:id => params[:target_role_ids]).to_a
+       end
++    @target_workspaces =
++      if params[:target_workspace_ids].blank?
++        nil
++      else
++        Workspace.where(:id => params[:target_workspace_ids]).to_a
++      end
+   end
+ 
+   def find_trackers_roles_and_statuses_for_edit
+     find_roles
+     find_trackers
++    find_workspaces
+     find_statuses
+   end
+ 
+@@ -155,15 +171,28 @@ class WorkflowsController < ApplicationController
+     @trackers = nil if @trackers.blank?
+   end
+ 
++  def find_workspaces
++    ids = Array.wrap(params[:workspace_id])
++    if ids == ['all']
++      @workspaces = Workspace.sorted.to_a
++    elsif ids.present?
++      @workspaces = Workspace.where(:id => ids).to_a
++    end
++    @workspaces = nil if @workspaces.blank?
++  end
++
+   def find_statuses
+     @used_statuses_only = (params[:used_statuses_only] == '0' ? false : true)
+-    if @trackers && @used_statuses_only
++    @used_workspaces_only = (params[:used_workspaces_only] == '0' ? false : true)
++    if @used_statuses_only || @used_workspaces_only
+       role_ids = Role.all.select(&:consider_workflow?).map(&:id)
+-      status_ids = WorkflowTransition.where(
+-        :tracker_id => @trackers.map(&:id), :role_id => role_ids
+-      ).distinct.pluck(:old_status_id, :new_status_id).flatten.uniq
+-      @statuses = IssueStatus.where(:id => status_ids).sorted.to_a.presence
++      status_ids = WorkflowRule.where(:role_id => role_ids)
++      status_ids = status_ids.where(:tracker_id => @trackers.map(&:id)) if @trackers && @used_statuses_only
++      status_ids = status_ids.where(:workspace_id => @workspaces.map(&:id)) if @workspaces && @used_workspaces_only
++      status_ids = status_ids.distinct.pluck(:old_status_id, :new_status_id).flatten.uniq
++      @statuses = IssueStatus.where(:id => status_ids).sorted.to_a
++    else
++      @statuses = IssueStatus.sorted.to_a
+     end
+-    @statuses ||= IssueStatus.sorted.to_a
+   end
+ end
+diff --git a/app/controllers/workspaces_controller.rb b/app/controllers/workspaces_controller.rb
+new file mode 100644
+index 000000000..604f22326
+--- /dev/null
++++ b/app/controllers/workspaces_controller.rb
+@@ -0,0 +1,80 @@
++# Redmine - project management software
++# Copyright (C) 2006-2017  Jean-Philippe Lang
++#
++# This program is free software; you can redistribute it and/or
++# modify it under the terms of the GNU General Public License
++# as published by the Free Software Foundation; either version 2
++# of the License, or (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; if not, write to the Free Software
++# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++
++class WorkspacesController < ApplicationController
++  layout 'admin'
++  self.main_menu = false
++
++  before_action :require_admin, :except => :index
++  before_action :require_admin_or_api_request, :only => :index
++  accept_api_auth :index
++
++  def index
++    @workspaces = Workspace.sorted.to_a
++    respond_to do |format|
++      format.html { render :layout => false if request.xhr? }
++      format.api
++    end
++  end
++
++  def new
++    @workspace = Workspace.new
++  end
++
++  def create
++    @workspace = Workspace.new
++    @workspace.safe_attributes = params[:workspace]
++    if @workspace.save
++      flash[:notice] = l(:notice_successful_create)
++      redirect_to workspaces_path
++    else
++      render :action => 'new'
++    end
++  end
++
++  def edit
++    @workspace = Workspace.find(params[:id])
++  end
++
++  def update
++    @workspace = Workspace.find(params[:id])
++    @workspace.safe_attributes = params[:workspace]
++    if @workspace.save
++      respond_to do |format|
++        format.html {
++          flash[:notice] = l(:notice_successful_update)
++          redirect_to workspaces_path(:page => params[:page])
++        }
++        format.js { head 200 }
++      end
++    else
++      respond_to do |format|
++        format.html { render :action => 'edit' }
++        format.js { head 422 }
++      end
++    end
++  end
++
++  def destroy
++    unless Project.where(:workspace_id => params[:id]).any? || params[:id] == "1"
++      Workspace.find(params[:id]).destroy
++    else
++      flash[:error] = l(:error_unable_delete_workspace)
++    end
++    redirect_to workspaces_path
++  end
++end
+diff --git a/app/helpers/members_helper.rb b/app/helpers/members_helper.rb
+index ed1f9ae4c..26aecb75a 100644
+--- a/app/helpers/members_helper.rb
++++ b/app/helpers/members_helper.rb
+@@ -48,6 +48,16 @@ module MembersHelper
+     s + content_tag('span', links, :class => 'pagination')
+   end
+ 
++  def role_color_and_hide(role, project = nil)
++    color_and_hide = ""
++    if ! role.assignable
++      color_and_hide += " style=color:darkblue"
++    elsif ! project.nil? && ! role.workflow_rules.where(:workspace_id => project.workspace_id).any?
++      color_and_hide += " class=unused style=color:darkred"
++    end
++    color_and_hide
++  end
++
+   # Returns inheritance information for an inherited member role
+   def render_role_inheritance(member, role)
+     content = member.role_inheritance(role).map do |h|
+diff --git a/app/helpers/projects_helper.rb b/app/helpers/projects_helper.rb
+index aabb3cb83..b40dd89bc 100644
+--- a/app/helpers/projects_helper.rb
++++ b/app/helpers/projects_helper.rb
+@@ -114,6 +114,18 @@ module ProjectsHelper
+     principals_options_for_select(assignable_users, project.default_assigned_to)
+   end
+ 
++  def project_workspace_options(project)
++    grouped = Hash.new {|h,k| h[k] = []}
++    Workspace.all.sorted.each do |workspace|
++      grouped[workspace.name] = workspace.id
++    end
++    options_for_select(grouped, project.workspace_id)
++  end
++
++  def used_workspaces_by_tracker
++    WorkflowRule.pluck(:tracker_id, :workspace_id).uniq.group_by(&:first).map{|k,a| [k,a.map{|x| "ws-" + x.last.to_s}.join(" ")]}.to_h
++  end
++
+   def project_default_issue_query_options(project)
+     public_queries = IssueQuery.only_public
+     grouped = {
+diff --git a/app/helpers/workflows_helper.rb b/app/helpers/workflows_helper.rb
+index 3de41950a..f564f6461 100644
+--- a/app/helpers/workflows_helper.rb
++++ b/app/helpers/workflows_helper.rb
+@@ -33,11 +33,6 @@ module WorkflowsHelper
+     else
+       selected = objects.first.try(:id)
+     end
+-    all_tag_options = {:value => 'all', :selected => (selected == 'all')}
+-    if multiple
+-      all_tag_options[:style] = "display:none;"
+-    end
+-    option_tags << content_tag('option', l(:label_all), all_tag_options)
+     option_tags << options_from_collection_for_select(objects, "id", "name", selected)
+     select_tag name, option_tags, {:multiple => multiple}.merge(options)
+   end
+@@ -53,7 +48,7 @@ module WorkflowsHelper
+     html_options = {}
+ 
+     if perm = permissions[status.id][name]
+-      if perm.uniq.size > 1 || perm.size < @roles.size * @trackers.size
++      if perm.uniq.size > 1 || perm.size < @roles.size * @trackers.size * @workspaces.size
+         options << [l(:label_no_change_option), "no_change"]
+         selected = 'no_change'
+       else
+@@ -80,7 +75,7 @@ module WorkflowsHelper
+     if old_status == new_status
+       check_box_tag(tag_name, "1", true,
+                     {:disabled => true, :class => "old-status-#{old_status.try(:id) || 0} new-status-#{new_status.id}"})
+-    elsif w == 0 || w == @roles.size * @trackers.size
++    elsif w == 0 || w == @roles.size * @trackers.size * @workspaces.size
+       hidden_field_tag(tag_name, "0", :id => nil) +
+       check_box_tag(tag_name, "1", w != 0,
+                     :class => "old-status-#{old_status.try(:id) || 0} new-status-#{new_status.id}")
+diff --git a/app/models/issue.rb b/app/models/issue.rb
+index 84907a475..3f913209e 100644
+--- a/app/models/issue.rb
++++ b/app/models/issue.rb
+@@ -686,7 +686,8 @@ class Issue < ActiveRecord::Base
+     workflow_permissions =
+       WorkflowPermission.where(
+         :tracker_id => tracker_id, :old_status_id => status_id,
+-        :role_id => roles.map(&:id)
++        :role_id => roles.map(&:id),
++        :workspace_id => project&.workspace_id
+       ).to_a
+     if workflow_permissions.any?
+       workflow_rules = workflow_permissions.inject({}) do |h, wp|
+@@ -1068,9 +1069,10 @@ class Issue < ActiveRecord::Base
+       initial_status,
+       user.admin ? Role.all.to_a : user.roles_for_project(project),
+       tracker,
++      project.workspace_id,
+       author == user,
+       assignee_transitions_allowed
+-    )
++    ) if project.present?
+     statuses << initial_status unless statuses.empty?
+     statuses << default_status if include_default || (new_record? && statuses.empty?)
+ 
+diff --git a/app/models/issue_status.rb b/app/models/issue_status.rb
+index d35edfbc3..ca653c891 100644
+--- a/app/models/issue_status.rb
++++ b/app/models/issue_status.rb
+@@ -54,18 +54,18 @@ class IssueStatus < ActiveRecord::Base
+   end
+ 
+   # Returns an array of all statuses the given role can switch to
+-  def new_statuses_allowed_to(roles, tracker, author=false, assignee=false)
+-    self.class.new_statuses_allowed(self, roles, tracker, author, assignee)
++  def new_statuses_allowed_to(roles, tracker, workspace_id, author=false, assignee=false)
++    self.class.new_statuses_allowed(self, roles, tracker, workspace_id, author, assignee)
+   end
+   alias :find_new_statuses_allowed_to :new_statuses_allowed_to
+ 
+-  def self.new_statuses_allowed(status, roles, tracker, author=false, assignee=false)
+-    if roles.present? && tracker
++  def self.new_statuses_allowed(status, roles, tracker, workspace_id, author=false, assignee=false)
++    if roles.present? && tracker && workspace_id
+       status_id = status.try(:id) || 0
+ 
+       scope = IssueStatus.
+         joins(:workflow_transitions_as_new_status).
+-        where(:workflows => {:old_status_id => status_id, :role_id => roles.map(&:id), :tracker_id => tracker.id})
++        where(:workflows => {:old_status_id => status_id, :role_id => roles.map(&:id), :tracker_id => tracker.id, :workspace_id => workspace_id})
+ 
+       unless author && assignee
+         if author || assignee
+diff --git a/app/models/project.rb b/app/models/project.rb
+index 7ba9b4197..8e4203c3d 100644
+--- a/app/models/project.rb
++++ b/app/models/project.rb
+@@ -42,6 +42,7 @@ class Project < ActiveRecord::Base
+   has_many :versions, :dependent => :destroy
+   belongs_to :default_version, :class_name => 'Version'
+   belongs_to :default_assigned_to, :class_name => 'Principal'
++  belongs_to :workspace
+   has_many :time_entries, :dependent => :destroy
+   has_many :queries, :dependent => :destroy
+   has_many :documents, :dependent => :destroy
+@@ -364,6 +365,7 @@ class Project < ActiveRecord::Base
+     @rolled_up_versions = nil
+     @rolled_up_trackers = nil
+     @rolled_up_statuses = nil
++    @rolled_up_workspaces = nil
+     @rolled_up_custom_fields = nil
+     @all_issue_custom_fields = nil
+     @all_time_entry_custom_fields = nil
+@@ -482,9 +484,29 @@ class Project < ActiveRecord::Base
+       sorted
+   end
+ 
++  def rolled_up_workspaces(include_subprojects=true)
++    if include_subprojects
++      @rolled_up_workspaces ||= rolled_up_workspaces_base_scope.
++      where("#{Project.table_name}.lft >= ? AND #{Project.table_name}.rgt <= ?", lft, rgt)
++    else
++      rolled_up_workspaces_base_scope.
++      where(:projects => {:id => id})
++    end
++  end
++
++  def rolled_up_workspaces_base_scope
++    Workspace.
++    joins(projects: :enabled_modules).
++    where("#{Project.table_name}.status <> ?", STATUS_ARCHIVED).
++    where(:enabled_modules => {:name => 'issue_tracking'}).
++    distinct.
++    sorted
++  end
++
+   def rolled_up_statuses
+     issue_status_ids = WorkflowTransition.
+       where(:tracker_id => rolled_up_trackers.map(&:id)).
++      where(:workspace_id => rolled_up_workspaces.map(&:id)).
+       distinct.
+       pluck(:old_status_id, :new_status_id).
+       flatten.
+@@ -827,6 +849,7 @@ class Project < ActiveRecord::Base
+     'parent_id',
+     'default_version_id',
+     'default_issue_query_id',
++    'workspace_id',
+     'default_assigned_to_id')
+ 
+   safe_attributes(
+diff --git a/app/models/role.rb b/app/models/role.rb
+index 790d09f27..2772c1778 100644
+--- a/app/models/role.rb
++++ b/app/models/role.rb
+@@ -269,7 +269,7 @@ class Role < ActiveRecord::Base
+   end
+ 
+   def copy_workflow_rules(source_role)
+-    WorkflowRule.copy(nil, source_role, nil, self)
++    WorkflowRule.copy(nil, source_role, nil, nil, self, nil)
+   end
+ 
+   # Find all the roles that can be given to a project member
+diff --git a/app/models/tracker.rb b/app/models/tracker.rb
+index c5665054c..d986f5dfb 100644
+--- a/app/models/tracker.rb
++++ b/app/models/tracker.rb
+@@ -140,7 +140,7 @@ class Tracker < ActiveRecord::Base
+   end
+ 
+   def copy_workflow_rules(source_tracker)
+-    WorkflowRule.copy(source_tracker, nil, self, nil)
++    WorkflowRule.copy(source_tracker, nil, nil, self, nil, nil)
+   end
+ 
+   # Returns the fields that are disabled for all the given trackers
+diff --git a/app/models/workflow_permission.rb b/app/models/workflow_permission.rb
+index d2d4317d4..622ce0f57 100644
+--- a/app/models/workflow_permission.rb
++++ b/app/models/workflow_permission.rb
+@@ -22,14 +22,14 @@ class WorkflowPermission < WorkflowRule
+   validates_presence_of :old_status
+   validate :validate_field_name
+ 
+-  # Returns the workflow permissions for the given trackers and roles
++  # Returns the workflow permissions for the given trackers, roles and workspaces
+   # grouped by status_id
+   #
+   # Example:
+-  #   WorkflowPermission.rules_by_status_id trackers, roles
++  #   WorkflowPermission.rules_by_status_id trackers, roles, workspaces
+   #   # => {1 => {'start_date' => 'required', 'due_date' => 'readonly'}}
+-  def self.rules_by_status_id(trackers, roles)
+-    WorkflowPermission.where(:tracker_id => trackers.map(&:id), :role_id => roles.map(&:id)).inject({}) do |h, w|
++  def self.rules_by_status_id(trackers, roles, workspaces)
++    WorkflowPermission.where(:tracker_id => trackers.map(&:id), :role_id => roles.map(&:id), :workspace_id => workspaces.map(&:id)).inject({}) do |h, w|
+       h[w.old_status_id] ||= {}
+       h[w.old_status_id][w.field_name] ||= []
+       h[w.old_status_id][w.field_name] << w.rule
+@@ -37,22 +37,25 @@ class WorkflowPermission < WorkflowRule
+     end
+   end
+ 
+-  # Replaces the workflow permissions for the given trackers and roles
++  # Replaces the workflow permissions for the given trackers, roles and workspaces
+   #
+   # Example:
+-  #   WorkflowPermission.replace_permissions trackers, roles, {'1' => {'start_date' => 'required', 'due_date' => 'readonly'}}
+-  def self.replace_permissions(trackers, roles, permissions)
++  #   WorkflowPermission.replace_permissions trackers, roles, {'1' => {'start_date' => 'required', 'due_date' => 'readonly'}}, workspaces
++  def self.replace_permissions(trackers, roles, permissions, workspaces)
+     trackers = Array.wrap trackers
+     roles = Array.wrap roles
++    workspaces = Array.wrap workspaces
+ 
+     transaction do
+       permissions.each do |status_id, rule_by_field|
+         rule_by_field.each do |field, rule|
+-          where(:tracker_id => trackers.map(&:id), :role_id => roles.map(&:id), :old_status_id => status_id, :field_name => field).destroy_all
++          where(:tracker_id => trackers.map(&:id), :role_id => roles.map(&:id), :old_status_id => status_id, :field_name => field, :workspace_id => workspaces.map(&:id)).destroy_all
+           if rule.present?
+             trackers.each do |tracker|
+               roles.each do |role|
+-                WorkflowPermission.create(:role_id => role.id, :tracker_id => tracker.id, :old_status_id => status_id, :field_name => field, :rule => rule)
++                workspaces.each do |workspace|
++                  WorkflowPermission.create(:role_id => role.id, :tracker_id => tracker.id, :old_status_id => status_id, :field_name => field, :rule => rule, :workspace_id => workspace.id)
++                end
+               end
+             end
+           end
+diff --git a/app/models/workflow_rule.rb b/app/models/workflow_rule.rb
+index a50cf01d2..1f747127f 100644
+--- a/app/models/workflow_rule.rb
++++ b/app/models/workflow_rule.rb
+@@ -24,57 +24,66 @@ class WorkflowRule < ActiveRecord::Base
+   belongs_to :tracker
+   belongs_to :old_status, :class_name => 'IssueStatus'
+   belongs_to :new_status, :class_name => 'IssueStatus'
++  belongs_to :workspace
+ 
+-  validates_presence_of :role, :tracker
++  validates_presence_of :role, :tracker, :workspace
+ 
+   # Copies workflows from source to targets
+-  def self.copy(source_tracker, source_role, target_trackers, target_roles)
+-    unless source_tracker.is_a?(Tracker) || source_role.is_a?(Role)
++  def self.copy(source_tracker, source_role, source_workspace, target_trackers, target_roles, target_workspaces)
++    unless source_tracker.is_a?(Tracker) || source_role.is_a?(Role) || source_workspace.is_a?(Workspace)
+       raise ArgumentError.new(
+-        "source_tracker or source_role must be specified, given: " \
+-          "#{source_tracker.class.name} and #{source_role.class.name}"
++        "source_tracker, source_role or source_workspace must be specified, given: " \
++          "#{source_tracker.class.name}, #{source_role.class.name} and #{source_workspace.class.name}"
+       )
+     end
+ 
+     target_trackers = [target_trackers].flatten.compact
+     target_roles = [target_roles].flatten.compact
++    target_workspaces = [target_workspaces].flatten.compact
+ 
+     target_trackers = Tracker.sorted.to_a if target_trackers.empty?
+     target_roles = Role.all.select(&:consider_workflow?) if target_roles.empty?
++    target_workspaces = Workspace.sorted.to_a if target_workspaces.empty?
+ 
+     target_trackers.each do |target_tracker|
+       target_roles.each do |target_role|
+-        copy_one(source_tracker || target_tracker,
+-                 source_role || target_role,
+-                 target_tracker,
+-                 target_role)
++        target_workspaces.each do |target_workspace|
++          copy_one(source_tracker || target_tracker,
++                     source_role || target_role,
++                     source_workspace || target_workspace,
++                     target_tracker,
++                     target_role,
++                     target_workspace)
++        end
+       end
+     end
+   end
+ 
+   # Copies a single set of workflows from source to target
+-  def self.copy_one(source_tracker, source_role, target_tracker, target_role)
++  def self.copy_one(source_tracker, source_role, source_workspace, target_tracker, target_role, target_workspace)
+     unless source_tracker.is_a?(Tracker) && !source_tracker.new_record? &&
+       source_role.is_a?(Role) && !source_role.new_record? &&
++      source_workspace.is_a?(Workspace) && !source_workspace.new_record? &&
+       target_tracker.is_a?(Tracker) && !target_tracker.new_record? &&
+-      target_role.is_a?(Role) && !target_role.new_record?
++      target_role.is_a?(Role) && !target_role.new_record? &&
++      target_workspace.is_a?(Workspace) && !target_workspace.new_record?
+ 
+       raise ArgumentError.new("arguments can not be nil or unsaved objects")
+     end
+ 
+-    if source_tracker == target_tracker && source_role == target_role
++    if source_tracker == target_tracker && source_role == target_role && source_workspace == target_workspace
+       false
+     else
+       transaction do
+-        where(:tracker_id => target_tracker.id, :role_id => target_role.id).delete_all
++        where(:tracker_id => target_tracker.id, :role_id => target_role.id, :workspace_id => target_workspace.id).delete_all
+         connection.insert(
+           "INSERT INTO #{WorkflowRule.table_name}" \
+             " (tracker_id, role_id, old_status_id, new_status_id," \
+-             " author, assignee, field_name, #{connection.quote_column_name 'rule'}, type)" \
++             " author, assignee, field_name, #{connection.quote_column_name 'rule'}, type, workspace_id)" \
+             " SELECT #{target_tracker.id}, #{target_role.id}, old_status_id, new_status_id," \
+-                    " author, assignee, field_name, #{connection.quote_column_name 'rule'}, type" \
++                    " author, assignee, field_name, #{connection.quote_column_name 'rule'}, type, #{target_workspace.id}" \
+               " FROM #{WorkflowRule.table_name}" \
+-              " WHERE tracker_id = #{source_tracker.id} AND role_id = #{source_role.id}"
++              " WHERE tracker_id = #{source_tracker.id} AND role_id = #{source_role.id} AND workspace_id = #{source_workspace.id}"
+         )
+       end
+       true
+diff --git a/app/models/workflow_transition.rb b/app/models/workflow_transition.rb
+index 4c9f4fed5..8f9e6ca22 100644
+--- a/app/models/workflow_transition.rb
++++ b/app/models/workflow_transition.rb
+@@ -20,65 +20,70 @@
+ class WorkflowTransition < WorkflowRule
+   validates_presence_of :new_status
+ 
+-  def self.replace_transitions(trackers, roles, transitions)
++  def self.replace_transitions(trackers, roles, transitions, workspaces)
+     trackers = Array.wrap trackers
+     roles = Array.wrap roles
++    workspaces = Array.wrap workspaces
+ 
+     transaction do
+-      records = WorkflowTransition.where(:tracker_id => trackers.map(&:id), :role_id => roles.map(&:id)).to_a
++      records = WorkflowTransition.where(:tracker_id => trackers.map(&:id), :role_id => roles.map(&:id), :workspace_id => workspaces.map(&:id)).to_a
+ 
+       transitions.each do |old_status_id, transitions_by_new_status|
+         transitions_by_new_status.each do |new_status_id, transition_by_rule|
+           transition_by_rule.each do |rule, transition|
+             trackers.each do |tracker|
+               roles.each do |role|
+-                w = records.select do |r|
+-                  r.old_status_id == old_status_id.to_i &&
+-                  r.new_status_id == new_status_id.to_i &&
+-                  r.tracker_id == tracker.id &&
+-                  r.role_id == role.id &&
+-                  !r.destroyed?
+-                end
+-                if rule == 'always'
+-                  w = w.select {|r| !r.author && !r.assignee}
+-                else
+-                  w = w.select {|r| r.author || r.assignee}
+-                end
+-                if w.size > 1
+-                  w[1..-1].each(&:destroy)
+-                end
+-                w = w.first
+-
+-                if ["1", true].include?(transition)
+-                  unless w
+-                    w = WorkflowTransition.
+-                          new(
+-                            :old_status_id => old_status_id,
+-                            :new_status_id => new_status_id,
+-                            :tracker_id => tracker.id,
+-                            :role_id => role.id
+-                          )
+-                    records << w
++                workspaces.each do |workspace|
++                  w = records.select do |r|
++                    r.old_status_id == old_status_id.to_i &&
++                    r.new_status_id == new_status_id.to_i &&
++                    r.tracker_id == tracker.id &&
++                    r.role_id == role.id &&
++                    r.workspace_id == workspace.id &&
++                    !r.destroyed?
+                   end
+-                  w.author = true if rule == "author"
+-                  w.assignee = true if rule == "assignee"
+-                  w.save if w.changed?
+-                elsif w
+                   if rule == 'always'
+-                    w.destroy
+-                  elsif rule == 'author'
+-                    if w.assignee
+-                      w.author = false
+-                      w.save if w.changed?
+-                    else
+-                      w.destroy
++                    w = w.select {|r| !r.author && !r.assignee}
++                  else
++                    w = w.select {|r| r.author || r.assignee}
++                  end
++                  if w.size > 1
++                    w[1..-1].each(&:destroy)
++                  end
++                  w = w.first
++
++                  if ["1", true].include?(transition)
++                    unless w
++                      w = WorkflowTransition.
++                            new(
++                              :old_status_id => old_status_id,
++                              :new_status_id => new_status_id,
++                              :tracker_id => tracker.id,
++                              :role_id => role.id,
++                              :workspace_id => workspace.id
++                            )
++                      records << w
+                     end
+-                  elsif rule == 'assignee'
+-                    if w.author
+-                      w.assignee = false
+-                      w.save if w.changed?
+-                    else
++                    w.author = true if rule == "author"
++                    w.assignee = true if rule == "assignee"
++                    w.save if w.changed?
++                  elsif w
++                    if rule == 'always'
+                       w.destroy
++                    elsif rule == 'author'
++                      if w.assignee
++                        w.author = false
++                        w.save if w.changed?
++                      else
++                        w.destroy
++                      end
++                    elsif rule == 'assignee'
++                      if w.author
++                        w.assignee = false
++                        w.save if w.changed?
++                      else
++                        w.destroy
++                      end
+                     end
+                   end
+                 end
+diff --git a/app/models/workspace.rb b/app/models/workspace.rb
+new file mode 100644
+index 000000000..df567d0b8
+--- /dev/null
++++ b/app/models/workspace.rb
+@@ -0,0 +1,58 @@
++# Redmine - project management software
++# Copyright (C) 2006-2017  Jean-Philippe Lang
++#
++# This program is free software; you can redistribute it and/or
++# modify it under the terms of the GNU General Public License
++# as published by the Free Software Foundation; either version 2
++# of the License, or (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; if not, write to the Free Software
++# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++
++class Workspace < ActiveRecord::Base
++  include Redmine::SafeAttributes
++
++  before_destroy :check_integrity
++  has_many :projects
++  has_many :workflow_rules, :dependent => :delete_all
++  acts_as_positioned
++
++  validates_presence_of :name
++  validates_uniqueness_of :name
++  validates_length_of :name, :maximum => 30
++
++  scope :sorted, lambda { order(:position) }
++
++  safe_attributes 'name',
++    'description',
++    'position'
++
++  # Returns an array of IssueStatus that are used in the tracker's workflows
++  def issue_statuses
++    if @issue_statuses
++      return @issue_statuses
++    elsif new_record?
++      return []
++    end
++
++    ids = WorkflowTransition.where(workspace_id: id).map{|w| [w.old_status_id, w.new_status_id]}.flatten.uniq
++    @issue_statuses = IssueStatus.where(:id => ids).all.sort
++  end
++
++  def <=>(workspace)
++    position <=> workspace.position
++  end
++
++  def to_s; name end
++
++private
++  def check_integrity
++    raise Exception.new("Cannot delete workspace") if Project.where(:workspace_id => self.id).any?
++  end
++end
+diff --git a/app/views/admin/projects.html.erb b/app/views/admin/projects.html.erb
+index aa462741d..19b4d1844 100644
+--- a/app/views/admin/projects.html.erb
++++ b/app/views/admin/projects.html.erb
+@@ -23,6 +23,7 @@
+   <th><%=l(:label_project)%></th>
+   <th><%=l(:field_is_public)%></th>
+   <th><%=l(:field_created_on)%></th>
++  <th><%=l(:field_workspace)%></th>
+   <th></th>
+   </tr></thead>
+   <tbody>
+@@ -31,6 +32,7 @@
+   <td class="name"><span><%= link_to_project_settings(project, {}, :title => project.short_description) %></span></td>
+   <td><%= checked_image project.is_public? %></td>
+   <td><%= format_date(project.created_on) %></td>
++  <td><%= @workspaces[project.workspace_id] %></td>
+   <td class="buttons">
+     <%= link_to(l(:button_archive), archive_project_path(project, :status => params[:status]), :data => {:confirm => l(:text_are_you_sure)}, :method => :post, :class => 'icon icon-lock') unless project.archived? %>
+     <%= link_to(l(:button_unarchive), unarchive_project_path(project, :status => params[:status]), :method => :post, :class => 'icon icon-unlock') if project.archived? %>
+diff --git a/app/views/members/_edit.html.erb b/app/views/members/_edit.html.erb
+index 8b05ae92f..fe6de3f96 100644
+--- a/app/views/members/_edit.html.erb
++++ b/app/views/members/_edit.html.erb
+@@ -3,16 +3,20 @@
+                       :remote => request.xhr?,
+                       :method => :put) do |f| %>
+   <p>
+-    <% @roles.each do |role| %>
+-    <label class="block">
++    <strong>
++      <%= l(:label_role_plural) %>
++      (<a onclick="$(this).closest('form').children('div.unused').toggle();"><%= l(:label_all) %></a>):
++    </strong>
++  </p>
++  <% @roles.each do |role| %>
++    <div<%= role_color_and_hide(role, @project) %>>
+       <%= check_box_tag('membership[role_ids][]',
+                         role.id, @member.roles.to_a.include?(role),
+                         :id => nil,
+                         :disabled => !@member.role_editable?(role)) %> <%= role %>
+       <%= render_role_inheritance(@member, role) %>
+-    </label>
+-    <% end %>
+-  </p>
++    </div>
++  <% end %>
+   <%= hidden_field_tag 'membership[role_ids][]', '', :id => nil %>
+   <p>
+     <%= submit_tag l(:button_save) %>
+diff --git a/app/views/members/_new_form.html.erb b/app/views/members/_new_form.html.erb
+index 70caa2600..b16e9ab3e 100644
+--- a/app/views/members/_new_form.html.erb
++++ b/app/views/members/_new_form.html.erb
+@@ -7,10 +7,10 @@
+   </div>
+ </fieldset>
+ <fieldset class="box">
+-  <legend><%= toggle_checkboxes_link('.roles-selection input') %><%= l(:label_role_plural) %></legend>
++  <legend><%= toggle_checkboxes_link('.roles-selection input:visible') %><%= l(:label_role_plural) %> (<a onclick='$(".unused").toggleClass("show");'><%= l(:label_all) %></a>)</legend>
+   <div class="roles-selection">
+     <% User.current.managed_roles(@project).each do |role| %>
+-      <label><%= check_box_tag 'membership[role_ids][]', role.id, false, :id => nil %> <%= role %></label>
++      <label<%= role_color_and_hide(role, @project) %>><%= check_box_tag 'membership[role_ids][]', role.id, false, :id => nil %><%= role %></label>
+     <% end %>
+   </div>
+ </fieldset>
+diff --git a/app/views/principal_memberships/_edit.html.erb b/app/views/principal_memberships/_edit.html.erb
+index 224303b7a..62c3da2fe 100644
+--- a/app/views/principal_memberships/_edit.html.erb
++++ b/app/views/principal_memberships/_edit.html.erb
+@@ -3,16 +3,20 @@
+                           :remote => request.xhr?,
+                           :method => :put) do %>
+   <p>
++    <strong>
++      <%= l(:label_role_plural) %>
++      (<a onclick="$(this).closest('form').children('div.unused').toggle();"><%= l(:label_all) %></a>):
++    </strong>
++  </p>
+   <% @roles.each do |role| %>
+-    <label class="block">
++    <div<%= role_color_and_hide(role, @membership.project) %>>
+       <%= check_box_tag 'membership[role_ids][]',
+             role.id, @membership.roles.to_a.include?(role),
+             :id => nil,
+             :disabled => !@membership.role_editable?(role) %> <%= role.name %>
+       <%= render_role_inheritance(@membership, role) %>
+-    </label>
++    </div>
+   <% end %>
+-  </p>
+   <%= hidden_field_tag 'membership[role_ids][]', '', :id => nil %>
+   <p>
+     <%= submit_tag l(:button_save) %>
+diff --git a/app/views/principal_memberships/_new_form.html.erb b/app/views/principal_memberships/_new_form.html.erb
+index 90d91fc71..06ec18b5f 100644
+--- a/app/views/principal_memberships/_new_form.html.erb
++++ b/app/views/principal_memberships/_new_form.html.erb
+@@ -15,7 +15,7 @@
+   <legend><%= toggle_checkboxes_link('.roles-selection input') %><%= l(:label_role_plural) %></legend>
+   <div class="roles-selection">
+   <% @roles.each do |role| %>
+-    <label>
++    <label<%= role_color_and_hide(role) %>>
+       <%= check_box_tag 'membership[role_ids][]', role.id, false, :id => nil %>
+       <%= role %>
+     </label>
+diff --git a/app/views/projects/_form.html.erb b/app/views/projects/_form.html.erb
+index 7c988fb0e..378cbfa2e 100644
+--- a/app/views/projects/_form.html.erb
++++ b/app/views/projects/_form.html.erb
+@@ -19,6 +19,10 @@
+     <p><%= label(:project, :parent_id, l(:field_parent)) %><%= parent_project_select_tag(@project) %></p>
+ <% end %>
+ 
++<% if @project.safe_attribute? 'workspace_id' %>
++<p><%= f.select :workspace_id, project_workspace_options(@project), {}, :onchange => "$('#project_trackers > label').hide(); $('#project_trackers > label.ws-' + this.value).show();" %></p>
++<% end %>
++
+ <% if @project.safe_attribute? 'inherit_members' %>
+ <p><%= f.check_box :inherit_members %></p>
+ <% end %>
+diff --git a/app/views/projects/index.api.rsb b/app/views/projects/index.api.rsb
+index 03c7c0c77..b37548534 100644
+--- a/app/views/projects/index.api.rsb
++++ b/app/views/projects/index.api.rsb
+@@ -7,6 +7,7 @@ api.array :projects, api_meta(:total_count => @project_count, :offset => @offset
+       api.description project.description
+       api.parent(:id => project.parent.id, :name => project.parent.name) if project.parent && project.parent.visible?
+       api.status      project.status
++      api.workspace   project.workspace.id
+       api.is_public   project.is_public?
+       api.inherit_members project.inherit_members?
+ 
+diff --git a/app/views/projects/settings/_issues.html.erb b/app/views/projects/settings/_issues.html.erb
+index 4fe977fb8..94b4e91f8 100644
+--- a/app/views/projects/settings/_issues.html.erb
++++ b/app/views/projects/settings/_issues.html.erb
+@@ -2,12 +2,13 @@
+   <%= hidden_field_tag 'tab', 'issues' %>
+ 
+   <% unless @trackers.empty? %>
+-  <fieldset class="box tabular" id="project_trackers"><legend><%= toggle_checkboxes_link('#project_trackers input[type=checkbox]') %><%= l(:label_tracker_plural)%></legend>
++  <fieldset class="box tabular" id="project_trackers"><legend><%= toggle_checkboxes_link('#project_trackers input[type=checkbox]:enabled:visible') %><%= l(:label_tracker_plural)%> (<a onclick="ws='.ws-' + $('#project_workspace_id').val(); $('#project_trackers > label' + ws).show(); $('#project_trackers > label:not(' + ws + ')').toggle();"><%= l(:label_all) %></a>)</legend>
+   <% if User.current.admin? %>
+     <div class="contextual"><%= link_to l(:label_administration), trackers_path, :class => "icon icon-settings" %></div>
+   <% end %>
++  <% uwbt=used_workspaces_by_tracker %>
+   <% @trackers.each do |tracker| %>
+-    <label class="floating">
++    <label class="floating <%= uwbt[tracker.id].to_s %>"<% unless uwbt[tracker.id].to_s.match(/\b#{@project.workspace_id}\b/) %>style="display: none;"<% end %>>
+       <%= check_box_tag 'project[tracker_ids][]', tracker.id, @project.trackers.to_a.include?(tracker), :id => nil %>
+       <%= tracker_name_tag tracker %>
+     </label>
+diff --git a/app/views/projects/show.api.rsb b/app/views/projects/show.api.rsb
+index 7ad4ecc30..f04e0e6e5 100644
+--- a/app/views/projects/show.api.rsb
++++ b/app/views/projects/show.api.rsb
+@@ -5,6 +5,7 @@ api.project do
+   api.description @project.description
+   api.homepage    @project.homepage
+   api.parent(:id => @project.parent.id, :name => @project.parent.name) if @project.parent && @project.parent.visible?
++  api.workspace(:id => @project.workspace.id, :name => @project.workspace.name) if User.current.admin?
+   api.status      @project.status
+   api.is_public   @project.is_public?
+   api.inherit_members @project.inherit_members?
+diff --git a/app/views/projects/show.html.erb b/app/views/projects/show.html.erb
+index 5c7ef440c..6badf4798 100644
+--- a/app/views/projects/show.html.erb
++++ b/app/views/projects/show.html.erb
+@@ -42,6 +42,9 @@
+   <% render_custom_field_values(@project) do |custom_field, formatted| %>
+     <li class="<%= custom_field.css_classes %>"><span class="label"><%= custom_field.name %>:</span> <%= formatted %></li>
+   <% end %>
++  <% if User.current.admin? %>
++    <li><span class="label"><%=l(:field_workspace)%>:</span> <%= @project.workspace.name %></li>
++  <% end %>
+   </ul>
+   <% end %>
+ 
+@@ -137,7 +140,7 @@
+ 	<ul class="subprojects">
+ 	  <% @subprojects.each do |project| %>
+ 	  <li><%= link_to(project.name, project_path(project), :class => project.css_classes).html_safe %></li>
+-	  <% end %> 
++	  <% end %>
+     </ul>
+   </div>
+   <% end %>
+diff --git a/app/views/workflows/_index_table.html.erb b/app/views/workflows/_index_table.html.erb
+new file mode 100644
+index 000000000..5d156ddfd
+--- /dev/null
++++ b/app/views/workflows/_index_table.html.erb
+@@ -0,0 +1,33 @@
++<div class="autoscroll">
++  <table class="list">
++    <thead>
++      <tr>
++        <th>
++        </th>
++        <% @roles.each do |role| %>
++          <% next unless @workflow_counts.select{|i,v| i[1]==role.id && i[2]==@workspace.id}.present? %>
++          <th>
++            <%= content_tag(role.builtin? ? 'em' : 'span', role.name) %>
++          </th>
++        <% end %>
++      </tr>
++    </thead>
++    <tbody>
++      <% @trackers.each do |tracker| -%>
++      <% next unless @workflow_counts.select{|i,v| i[0]==tracker.id && i[2]==@workspace.id}.present? %>
++        <tr>
++          <td class="name"><%= tracker.name %></td>
++          <% @roles.each do |role| -%>
++          <% next unless @workflow_counts.select{|i,v| i[1]==role.id && i[2]==@workspace.id}.present? %>
++            <td>
++              <% count = @workflow_counts[[tracker.id, role.id, @workspace.id]] || 0 %>
++              <%= link_to((count > 0 ? count : content_tag(:span, nil, :class => 'icon-only icon-not-ok')),
++                {:action => 'edit', :role_id => role, :tracker_id => tracker, :workspace_id => @workspace},
++                :title => l(:button_edit)) %>
++            </td>
++          <% end -%>
++        </tr>
++      <% end -%>
++    </tbody>
++  </table>
++</div>
+diff --git a/app/views/workflows/copy.html.erb b/app/views/workflows/copy.html.erb
+index cd270a8db..1af49ab0a 100644
+--- a/app/views/workflows/copy.html.erb
++++ b/app/views/workflows/copy.html.erb
+@@ -3,6 +3,13 @@
+ <%= form_tag duplicate_workflows_path, method: :post, id: 'workflow_copy_form' do %>
+ <fieldset class="tabular box">
+ <legend><%= l(:label_copy_source) %></legend>
++<p>
++  <label><%= l(:label_role) %></label>
++  <%= select_tag('source_role_id',
++                  content_tag('option', "--- #{l(:actionview_instancetag_blank_option)} ---", :value => '') +
++                  content_tag('option', "--- #{ l(:label_copy_same_as_target) } ---", :value => 'any') +
++                  options_from_collection_for_select(@roles, 'id', 'name', @source_role && @source_role.id)) %>
++</p>
+ <p>
+   <label><%= l(:label_tracker) %></label>
+   <%= select_tag('source_tracker_id',
+@@ -11,16 +18,22 @@
+                   options_from_collection_for_select(@trackers, 'id', 'name', @source_tracker && @source_tracker.id)) %>
+ </p>
+ <p>
+-  <label><%= l(:label_role) %></label>
+-  <%= select_tag('source_role_id',
++  <label><%= l(:label_workspace) %></label>
++  <%= select_tag('source_workspace_id',
+                   content_tag('option', "--- #{l(:actionview_instancetag_blank_option)} ---", :value => '') +
+                   content_tag('option', "--- #{ l(:label_copy_same_as_target) } ---", :value => 'any') +
+-                  options_from_collection_for_select(@roles, 'id', 'name', @source_role && @source_role.id)) %>
++                  options_from_collection_for_select(@workspaces, 'id', 'name', @source_workspace && @source_workspace.id)) %>
+ </p>
+ </fieldset>
+ 
+ <fieldset class="tabular box">
+ <legend><%= l(:label_copy_target) %></legend>
++<p>
++  <label><%= l(:label_role) %></label>
++  <%= select_tag 'target_role_ids',
++                  content_tag('option', "--- #{l(:actionview_instancetag_blank_option)} ---", :value => '', :disabled => true) +
++                  options_from_collection_for_select(@roles, 'id', 'name', @target_roles && @target_roles.map(&:id)), :multiple => true %>
++</p>
+ <p>
+   <label><%= l(:label_tracker) %></label>
+   <%= select_tag 'target_tracker_ids',
+@@ -28,10 +41,10 @@
+                   options_from_collection_for_select(@trackers, 'id', 'name', @target_trackers && @target_trackers.map(&:id)), :multiple => true %>
+ </p>
+ <p>
+-  <label><%= l(:label_role) %></label>
+-  <%= select_tag 'target_role_ids',
++  <label><%= l(:label_workspace) %></label>
++  <%= select_tag 'target_workspace_ids',
+                   content_tag('option', "--- #{l(:actionview_instancetag_blank_option)} ---", :value => '', :disabled => true) +
+-                  options_from_collection_for_select(@roles, 'id', 'name', @target_roles && @target_roles.map(&:id)), :multiple => true %>
++                  options_from_collection_for_select(@workspaces, 'id', 'name', @target_workspaces && @target_workspaces.map(&:id)), :multiple => true %>
+ </p>
+ </fieldset>
+ <%= submit_tag l(:button_copy) %>
+diff --git a/app/views/workflows/edit.html.erb b/app/views/workflows/edit.html.erb
+index df4507be2..94fcb98b4 100644
+--- a/app/views/workflows/edit.html.erb
++++ b/app/views/workflows/edit.html.erb
+@@ -4,8 +4,8 @@
+ 
+ <div class="tabs">
+   <ul>
+-    <li><%= link_to l(:label_status_transitions), edit_workflows_path(:role_id => @roles, :tracker_id => @trackers), :class => 'selected' %></li>
+-    <li><%= link_to l(:label_fields_permissions), permissions_workflows_path(:role_id => @roles, :tracker_id => @trackers) %></li>
++    <li><%= link_to l(:label_status_transitions), edit_workflows_path(:role_id => @roles, :tracker_id => @trackers, :workspace_id => @workspaces), :class => 'selected' %></li>
++    <li><%= link_to l(:label_fields_permissions), permissions_workflows_path(:role_id => @roles, :tracker_id => @trackers, :workspace_id => @workspaces) %></li>
+   </ul>
+ </div>
+ 
+@@ -23,19 +23,28 @@
+   <span class="toggle-multiselect icon-only"></span>
+   </label>
+ 
++  <label><%=l(:label_workspace)%>:
++  <%= options_for_workflow_select 'workspace_id[]', Workspace.sorted, @workspaces, :id => 'workspace_id', :class => 'expandable' %>
++  <span class="toggle-multiselect icon-only"></span>
++  </label>
++
+   <%= submit_tag l(:button_edit), :name => nil %>
+ 
+   <%= hidden_field_tag 'used_statuses_only', '0', :id => nil %>
+   <label><%= check_box_tag 'used_statuses_only', '1', @used_statuses_only %> <%= l(:label_display_used_statuses_only) %></label>
+ 
++  <%= hidden_field_tag 'used_workspaces_only', '0', :id => nil %>
++  <label><%= check_box_tag 'used_workspaces_only', '1', @used_workspaces_only %> <%= l(:label_display_used_workspaces_only) %></label>
+ </p>
+ <% end %>
+ 
+-<% if @trackers && @roles && @statuses.any? %>
++<% if @trackers && @roles && @workspaces && @statuses.any? %>
+   <%= form_tag workflows_path, method: :patch, id: 'workflow_form' do %>
+     <%= @trackers.map {|tracker| hidden_field_tag 'tracker_id[]', tracker.id, :id => nil}.join.html_safe %>
+     <%= @roles.map {|role| hidden_field_tag 'role_id[]', role.id, :id => nil}.join.html_safe %>
++    <%= @workspaces.map {|workspace| hidden_field_tag 'workspace_id[]', workspace.id, :id => nil}.join.html_safe %>
+     <%= hidden_field_tag 'used_statuses_only', params[:used_statuses_only], :id => nil %>
++    <%= hidden_field_tag 'used_workspaces_only', params[:used_workspaces_only], :id => nil %>
+     <div class="autoscroll">
+       <%= render :partial => 'form', :locals => {:name => 'always', :workflows => @workflows['always']} %>
+ 
+@@ -57,4 +66,4 @@
+     </div>
+     <%= submit_tag l(:button_save) %>
+   <% end %>
+-<% end %>
+\ No newline at end of file
++<% end %>
+diff --git a/app/views/workflows/index.html.erb b/app/views/workflows/index.html.erb
+index 659b55c25..cb132d2c3 100644
+--- a/app/views/workflows/index.html.erb
++++ b/app/views/workflows/index.html.erb
+@@ -1,35 +1,14 @@
+ <%= title [l(:label_workflow), edit_workflows_path], l(:field_summary) %>
+ 
+ <% if @roles.empty? || @trackers.empty? %>
+-<p class="nodata"><%= l(:label_no_data) %></p>
++  <p class="nodata"><%= l(:label_no_data) %></p>
+ <% else %>
+-<div class="autoscroll">
+-<table class="list">
+-<thead>
+-    <tr>
+-    <th></th>
+-    <% @roles.each do |role| %>
+-    <th>
+-        <%= content_tag(role.builtin? ? 'em' : 'span', role.name) %>
+-    </th>
+-    <% end %>
+-    </tr>
+-</thead>
+-<tbody>
+-<% @trackers.each do |tracker| -%>
+-<tr>
+-  <td class="name"><%= tracker.name %></td>
+-  <% @roles.each do |role| -%>
+-  <% count = @workflow_counts[[tracker.id, role.id]] || 0 %>
+-    <td>
+-      <%= link_to((count > 0 ? count : content_tag(:span, nil, :class => 'icon-only icon-not-ok')),
+-                  {:action => 'edit', :role_id => role, :tracker_id => tracker},
+-                  :title => l(:button_edit)) %>
+-    </td>
+-  <% end -%>
+-</tr>
+-<% end -%>
+-</tbody>
+-</table>
+-</div>
++  <p><label><%=l(:label_workspace)%>:
++    <select id="workspace_id" class="expandable" onchange="location.href=location.href.split('?')[0] + '?workspace_id=' + this.options[this.selectedIndex].value;">
++      <%= options_for_select(@workspaces.pluck(:name, :id), @workspace.id) %>
++    </select>
++  </label></p>
++  <div class="autoscroll ws">
++    <%= render :partial => 'index_table' %>
++  </div>
+ <% end %>
+diff --git a/app/views/workflows/permissions.html.erb b/app/views/workflows/permissions.html.erb
+index c366a7838..b4e36842f 100644
+--- a/app/views/workflows/permissions.html.erb
++++ b/app/views/workflows/permissions.html.erb
+@@ -4,8 +4,8 @@
+ 
+ <div class="tabs">
+   <ul>
+-    <li><%= link_to l(:label_status_transitions), edit_workflows_path(:role_id => @roles, :tracker_id => @trackers) %></li>
+-    <li><%= link_to l(:label_fields_permissions), permissions_workflows_path(:role_id => @roles, :tracker_id => @trackers), :class => 'selected' %></li>
++    <li><%= link_to l(:label_status_transitions), edit_workflows_path(:role_id => @roles, :tracker_id => @trackers, :workspace_id => @workspaces) %></li>
++    <li><%= link_to l(:label_fields_permissions), permissions_workflows_path(:role_id => @roles, :tracker_id => @trackers, :workspace_id => @workspaces), :class => 'selected' %></li>
+   </ul>
+ </div>
+ 
+@@ -22,18 +22,28 @@
+   <%= options_for_workflow_select 'tracker_id[]', Tracker.sorted, @trackers, :id => 'tracker_id', :class => 'expandable' %>
+   <span class="toggle-multiselect icon-only"></span>
+   </label>
++
++  <label><%=l(:label_workspace)%>:
++  <%= options_for_workflow_select 'workspace_id[]', Workspace.sorted, @workspaces, :id => 'workspace_id', :class => 'expandable' %>
++  <span class="toggle-multiselect icon-only"></span>
++  </label>
+   <%= submit_tag l(:button_edit), :name => nil %>
+ 
+   <%= hidden_field_tag 'used_statuses_only', '0', :id => nil %>
+   <label><%= check_box_tag 'used_statuses_only', '1', @used_statuses_only %> <%= l(:label_display_used_statuses_only) %></label>
++
++  <%= hidden_field_tag 'used_workspaces_only', '0', :id => nil %>
++  <label><%= check_box_tag 'used_workspaces_only', '1', @used_workspaces_only %> <%= l(:label_display_used_workspaces_only) %></label>
+ </p>
+ <% end %>
+ 
+-<% if @trackers && @roles && @statuses.any? %>
++<% if @trackers && @roles && @workspaces && @statuses.any? %>
+   <%= form_tag update_permissions_workflows_path, method: :patch, id: 'workflow_form' do %>
+     <%= @trackers.map {|tracker| hidden_field_tag 'tracker_id[]', tracker.id, :id => nil}.join.html_safe %>
+     <%= @roles.map {|role| hidden_field_tag 'role_id[]', role.id, :id => nil}.join.html_safe %>
++    <%= @workspaces.map {|workspace| hidden_field_tag 'workspace_id[]', workspace.id, :id => nil}.join.html_safe %>
+     <%= hidden_field_tag 'used_statuses_only', params[:used_statuses_only], :id => nil %>
++    <%= hidden_field_tag 'used_workspaces_only', params[:used_workspaces_only], :id => nil %>
+     <div class="autoscroll">
+     <table class="list workflows fields_permissions">
+     <thead>
+diff --git a/app/views/workspaces/_form.html.erb b/app/views/workspaces/_form.html.erb
+new file mode 100644
+index 000000000..dc26bb025
+--- /dev/null
++++ b/app/views/workspaces/_form.html.erb
+@@ -0,0 +1,8 @@
++<%= error_messages_for 'workspace' %>
++
++<div class="box tabular">
++<p><%= f.text_field :name, :required => true %></p>
++<p><%= f.text_field :description %></p>
++
++<%= call_hook(:view_workspaces_form, :workspace => @workspace) %>
++</div>
+diff --git a/app/views/workspaces/edit.html.erb b/app/views/workspaces/edit.html.erb
+new file mode 100644
+index 000000000..266291444
+--- /dev/null
++++ b/app/views/workspaces/edit.html.erb
+@@ -0,0 +1,6 @@
++<%= title [l(:label_workspace_plural), workspaces_path], @workspace.name %>
++
++<%= labelled_form_for @workspace do |f| %>
++  <%= render :partial => 'form', :locals => {:f => f} %>
++  <%= submit_tag l(:button_save) %>
++<% end %>
+diff --git a/app/views/workspaces/index.api.rsb b/app/views/workspaces/index.api.rsb
+new file mode 100644
+index 000000000..928d1e4ac
+--- /dev/null
++++ b/app/views/workspaces/index.api.rsb
+@@ -0,0 +1,9 @@
++api.array :workspaces do
++  @workspaces.each do |workspace|
++    api.workspace do
++      api.id          workspace.id
++      api.name        workspace.name
++      api.description workspace.description
++    end
++  end
++end
+diff --git a/app/views/workspaces/index.html.erb b/app/views/workspaces/index.html.erb
+new file mode 100644
+index 000000000..d4d222275
+--- /dev/null
++++ b/app/views/workspaces/index.html.erb
+@@ -0,0 +1,31 @@
++<div class="contextual">
++<%= link_to l(:label_workspace_new), new_workspace_path, :class => 'icon icon-add' %>
++</div>
++
++<h2><%=l(:label_workspace_plural)%></h2>
++
++<table class="list workspaces">
++  <thead><tr>
++  <th><%=l(:field_name)%></th>
++  <th><%=l(:field_description)%></th>
++  <th></th>
++  </tr></thead>
++  <tbody>
++<% for workspace in @workspaces %>
++  <tr class="<%= workspace.id == 1 ? "builtin" : "givable" %>">
++  <td class="name"><%= link_to workspace.name, edit_workspace_path(workspace) %></td>
++  <td class="description"><%= link_to workspace.description, edit_workspace_path(workspace) %></td>
++  <td class="buttons">
++    <%= reorder_handle(workspace) unless workspace.id == 1 %>
++    <%= delete_link workspace_path(workspace) unless workspace.id == 1 %>
++  </td>
++  </tr>
++<% end %>
++  </tbody>
++</table>
++
++<% html_title(l(:label_workspace_plural)) -%>
++
++<%= javascript_tag do %>
++  $(function() { $("table.workspaces tbody").positionedItems({items: ".givable"}); });
++<% end %>
+diff --git a/app/views/workspaces/new.html.erb b/app/views/workspaces/new.html.erb
+new file mode 100644
+index 000000000..9c460c3a0
+--- /dev/null
++++ b/app/views/workspaces/new.html.erb
+@@ -0,0 +1,6 @@
++<%= title [l(:label_workspace_plural), workspaces_path], l(:label_workspace_new) %>
++
++<%= labelled_form_for @workspace do |f| %>
++  <%= render :partial => 'form', :locals => {:f => f} %>
++  <%= submit_tag l(:button_create) %>
++<% end %>
+diff --git a/config/locales/en.yml b/config/locales/en.yml
+index 7749cf4e4..cb9431123 100644
+--- a/config/locales/en.yml
++++ b/config/locales/en.yml
+@@ -637,6 +637,11 @@ en:
+   label_tracker_plural: Trackers
+   label_tracker_all: All trackers
+   label_tracker_new: New tracker
++  label_workspace: Workspace
++  label_workspace_plural: Workspaces
++  label_workspace_new: New workspace
++  error_unable_delete_workspace: Unable to delete workspace
++  field_workspace: Workspace
+   label_workflow: Workflow
+   label_issue_status: Issue status
+   label_issue_status_plural: Issue statuses
+@@ -991,6 +996,7 @@ en:
+   label_copy_target: Target
+   label_copy_same_as_target: Same as target
+   label_display_used_statuses_only: Only display statuses that are used by this tracker
++  label_display_used_workspaces_only: Only display statuses that are used by this workspace
+   label_api_access_key: API access key
+   label_missing_api_access_key: Missing an API access key
+   label_api_access_key_created_on: "API access key created %{value} ago"
+diff --git a/config/locales/pt-BR.yml b/config/locales/pt-BR.yml
+index 244f15320..ce6086981 100644
+--- a/config/locales/pt-BR.yml
++++ b/config/locales/pt-BR.yml
+@@ -378,6 +378,11 @@ pt-BR:
+   label_tracker: Tipo de tarefa
+   label_tracker_plural: Tipos de tarefas
+   label_tracker_new: Novo tipo
++  label_workspace: Espaço de trabalho
++  label_workspace_plural: Espaços de trabalho
++  label_workspace_new: Novo espaço de trabalho
++  error_unable_delete_workspace: Não foi possível excluir espaço de trabalho
++  field_workspace: Espaço de trabalho
+   label_workflow: Fluxo de trabalho
+   label_issue_status: Situação da tarefa
+   label_issue_status_plural: Situação das tarefas
+@@ -876,6 +881,7 @@ pt-BR:
+   field_watcher: Observador
+   permission_view_issues: Ver tarefas
+   label_display_used_statuses_only: Somente exibir situações que são usadas por este tipo de tarefa
++  label_display_used_workspaces_only: Somente situações deste espaço de trabalho
+   label_revision_id: Revisão %{value}
+   label_api_access_key: Chave de acesso à API
+   button_show: Exibir
+diff --git a/config/routes.rb b/config/routes.rb
+index 1cfcc7b06..c108e4507 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -374,6 +374,8 @@ Rails.application.routes.draw do
+     end
+   end
+ 
++  resources :workspaces, :except => :show
++
+   resources :workflows, only: [:index] do
+     collection do
+       get 'edit'
+diff --git a/db/migrate/20160314174310_add_workspace_to_projects.rb b/db/migrate/20160314174310_add_workspace_to_projects.rb
+new file mode 100644
+index 000000000..c8c37c054
+--- /dev/null
++++ b/db/migrate/20160314174310_add_workspace_to_projects.rb
+@@ -0,0 +1,9 @@
++class AddWorkspaceToProjects < ActiveRecord::Migration[4.2]
++  def self.up
++    add_column :projects, :workspace_id, :integer, :default => 1
++  end
++
++  def self.down
++    remove_column :projects, :workspace_id
++  end
++end
+diff --git a/db/migrate/20160314174311_add_workspace_to_workflows.rb b/db/migrate/20160314174311_add_workspace_to_workflows.rb
+new file mode 100644
+index 000000000..964c3f057
+--- /dev/null
++++ b/db/migrate/20160314174311_add_workspace_to_workflows.rb
+@@ -0,0 +1,9 @@
++class AddWorkspaceToWorkflows < ActiveRecord::Migration[4.2]
++  def self.up
++    add_column :workflows, :workspace_id, :integer, :default => 1
++  end
++
++  def self.down
++    remove_column :workflows, :workspace_id
++  end
++end
+diff --git a/db/migrate/20160314174312_create_workspaces.rb b/db/migrate/20160314174312_create_workspaces.rb
+new file mode 100644
+index 000000000..602cb1cc2
+--- /dev/null
++++ b/db/migrate/20160314174312_create_workspaces.rb
+@@ -0,0 +1,18 @@
++class CreateWorkspaces < ActiveRecord::Migration[4.2]
++  def self.up
++    create_table :workspaces do |t|
++      t.string :name
++      t.string :description
++      t.integer :position, :default => nil, :null => true
++    end
++
++    # create default workspace
++    unless Workspace.exists?(1)
++      Workspace.create(:name => "Default", :description => "Default workspace", :position => 1)
++    end
++  end
++
++  def self.down
++    drop_table :workspaces
++  end
++end
+diff --git a/lib/redmine/preparation.rb b/lib/redmine/preparation.rb
+index 4e4b4e866..f85d94194 100644
+--- a/lib/redmine/preparation.rb
++++ b/lib/redmine/preparation.rb
+@@ -256,6 +256,9 @@ module Redmine
+         menu.push :issue_statuses, {:controller => 'issue_statuses'},
+                   :caption => :label_issue_status_plural,
+                   :html => {:class => 'icon icon-issue-edit'}
++        menu.push :workspaces, {:controller => 'workspaces'},
++                  :caption => :label_workspace_plural,
++                  :html => {:class => 'icon icon-multiple'}
+         menu.push :workflows, {:controller => 'workflows', :action => 'edit'},
+                   :caption => :label_workflow,
+                   :html => {:class => 'icon icon-workflows'}
+diff --git a/public/stylesheets/application.css b/public/stylesheets/application.css
+index 5fb8171c2..685e11fc8 100644
+--- a/public/stylesheets/application.css
++++ b/public/stylesheets/application.css
+@@ -670,6 +670,9 @@ body.controller-versions.action-show div#roadmap .related-issues {width:70%;}
+ 
+ div#roadmap .version-article {padding-bottom: 12px;}
+ 
++span.tip_exp_on {font-weight:bold; position:relative; color:#fff; background:#9DB9D5; padding:0px 6px 1px 6px; border-radius:3px; margin-left:4px;}
++span.tip_exp_off {font-weight:bold; position:relative; color:#fff; background:#9DB9D5; padding:0px 6px 1px 6px; border-radius:3px; margin-left:4px;}
++
+ div#version-summary { float:right; width:28%; margin-left: 16px; margin-bottom: 16px; background-color: #fff; }
+ div#version-summary fieldset { margin-bottom: 1em; }
+ div#version-summary fieldset.time-tracking table { width:100%; }
+@@ -999,6 +1002,9 @@ select.bool_cf {width:auto !important;}
+ 
+ input#principal_search, input#user_search {width:90%}
+ .roles-selection label {display:inline-block; width:210px;}
++.roles-selection .unused {display:none;}
++.roles-selection .unused.show {display:inline-block;}
++.unused {display:none;}
+ 
+ input.autocomplete {
+   background: #fff url(../images/magnifier.png) no-repeat 2px 50%; padding-left:20px !important;
